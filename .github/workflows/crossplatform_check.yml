@@ -1,0 +1,375 @@
+name: crossplatform_check
+
+# Cross-platform run of the test suite (Windows, macOS arm64, Linux) against
+# Blender 5.0.1 and the latest stable release, with Blender downloaded straight
+# from download.blender.org. Every job also runs the suite on the parent commit
+# (the base this branch was cut from), so a failure that also happens there is
+# reported as pre-existing instead of being blamed on the change.
+
+on:
+  push:
+    branches: [ci-crossplatform-check]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / blender ${{ matrix.blender }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        blender: ["5.0.1", "latest"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+          path: src
+
+      - name: Prepare paths
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            T=$(cygpath -u "$RUNNER_TEMP"); W=$(cygpath -u "$GITHUB_WORKSPACE")
+          else
+            T="$RUNNER_TEMP"; W="$GITHUB_WORKSPACE"
+          fi
+          mkdir -p "$T/out"
+          {
+            echo "TMPD=$T"
+            echo "OUT=$T/out"
+            echo "SRC=$W/src"
+            echo "BASE_SRC=$W/base"
+          } >> "$GITHUB_ENV"
+          # The PR commit is HEAD~1 (HEAD only adds this workflow); its parent
+          # is the base the change was written against.
+          cd src
+          git log --oneline -3
+          echo "PR_SHA=$(git rev-parse HEAD~1)" >> "$GITHUB_ENV"
+          echo "BASE_SHA=$(git rev-parse HEAD~2)" >> "$GITHUB_ENV"
+
+      - name: Install Linux runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libxi6 libxxf86vm1 libxfixes3 \
+            libxrender1 libxkbcommon0 libxkbcommon-x11-0 libsm6 libice6 \
+            libgl1 libegl1 libgl1-mesa-dri libglu1-mesa libwayland-client0 \
+            libwayland-cursor0 libwayland-egl1 libdecor-0-0 xz-utils > /dev/null
+
+      - name: Resolve Blender version
+        run: |
+          v="${{ matrix.blender }}"
+          if [ "$v" = "latest" ]; then
+            # Newest X.Y.Z (no -rc/-beta) in the newest series that has one.
+            for s in $(curl -fsSL --retry 5 https://download.blender.org/release/ \
+                         | grep -oE 'Blender[0-9]+\.[0-9]+/' | sed -E 's/Blender([0-9.]+)\//\1/' \
+                         | sort -u | sort -t. -k1,1nr -k2,2nr); do
+              v=$(curl -fsSL --retry 5 "https://download.blender.org/release/Blender$s/" \
+                    | grep -oE 'blender-[0-9]+\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz' \
+                    | sed -E 's/blender-([0-9.]+)-linux.*/\1/' \
+                    | sort -u | sort -t. -k1,1n -k2,2n -k3,3n | tail -1 || true)
+              [ -n "$v" ] && break
+            done
+          fi
+          [ -n "$v" ] || { echo "::error::could not resolve Blender version"; exit 1; }
+          series=$(echo "$v" | cut -d. -f1,2)
+          echo "Blender $v (series $series)"
+          echo "BL_VERSION=$v" >> "$GITHUB_ENV"
+          echo "BL_SERIES=$series" >> "$GITHUB_ENV"
+
+      - name: Download Blender
+        run: |
+          cd "$TMPD"
+          case "$RUNNER_OS" in
+            Linux)   f="blender-$BL_VERSION-linux-x64.tar.xz" ;;
+            macOS)   f="blender-$BL_VERSION-macos-arm64.dmg" ;;
+            Windows) f="blender-$BL_VERSION-windows-x64.zip" ;;
+          esac
+          base="https://download.blender.org/release/Blender$BL_SERIES"
+          curl -fL --retry 5 --retry-delay 10 -sS -o "$f" "$base/$f"
+          curl -fL --retry 5 -sS -o sums.sha256 "$base/blender-$BL_VERSION.sha256"
+          grep " $f\$" sums.sha256 > check.sha256 || grep "$f" sums.sha256 > check.sha256
+          if command -v sha256sum > /dev/null; then sha256sum -c check.sha256; else shasum -a 256 -c check.sha256; fi
+          case "$RUNNER_OS" in
+            Linux)
+              tar -xJf "$f"
+              bl="$TMPD/blender-$BL_VERSION-linux-x64/blender" ;;
+            macOS)
+              hdiutil attach -nobrowse -readonly -mountpoint "$TMPD/bl_dmg" "$f"
+              cp -R "$TMPD/bl_dmg/Blender.app" "$TMPD/Blender.app"
+              hdiutil detach "$TMPD/bl_dmg" || hdiutil detach -force "$TMPD/bl_dmg"
+              bl="$TMPD/Blender.app/Contents/MacOS/Blender" ;;
+            Windows)
+              7z x -y -bd "$(cygpath -w "$TMPD/$f")" -o"$(cygpath -w "$TMPD")" > /dev/null
+              bl="$TMPD/blender-$BL_VERSION-windows-x64/blender.exe" ;;
+          esac
+          rm -f "$f"
+          test -x "$bl" || { echo "::error::Blender binary not found at $bl"; ls -la "$TMPD"; exit 1; }
+          echo "BLENDER=$bl" >> "$GITHUB_ENV"
+          echo "BLENDER_DIR=$(dirname "$bl")" >> "$GITHUB_ENV"
+          "$bl" --version | tee "$OUT/blender_version.txt"
+
+      - name: Validate, build and install (PR commit)
+        working-directory: src
+        run: |
+          set -o pipefail
+          wp() { if [ "$RUNNER_OS" = "Windows" ]; then cygpath -w "$1"; else echo "$1"; fi; }
+          export BLENDER_USER_RESOURCES="$(wp "$TMPD/user_pr")"
+          git checkout -q "$PR_SHA"
+          "$BLENDER" --background --command extension validate 2>&1 | tee "$OUT/validate.log"
+          "$BLENDER" --background --command extension build --output-filepath ./CAD_Sketcher.zip 2>&1 | tee "$OUT/build.log"
+          "$BLENDER" --background --command extension install-file --repo user_default --enable ./CAD_Sketcher.zip 2>&1 | tee "$OUT/install.log"
+
+      - name: Run tests (PR commit)
+        id: tests_pr
+        continue-on-error: true
+        working-directory: src
+        run: |
+          set -o pipefail
+          wp() { if [ "$RUNNER_OS" = "Windows" ]; then cygpath -w "$1"; else echo "$1"; fi; }
+          export BLENDER_USER_RESOURCES="$(wp "$TMPD/user_pr")"
+          export CAD_SKETCHER_SRC="$(wp "$SRC")"
+          "$BLENDER" --background --python ./scripts/ci_run_tests.py 2>&1 | tee "$OUT/tests_pr.log"
+
+      - name: Run tests (base commit, for comparison)
+        id: tests_base
+        if: always()
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          wp() { if [ "$RUNNER_OS" = "Windows" ]; then cygpath -w "$1"; else echo "$1"; fi; }
+          git -C "$SRC" worktree add -f "$BASE_SRC" "$BASE_SHA"
+          cd "$BASE_SRC"
+          export BLENDER_USER_RESOURCES="$(wp "$TMPD/user_base")"
+          export CAD_SKETCHER_SRC="$(wp "$BASE_SRC")"
+          "$BLENDER" --background --command extension build --output-filepath ./CAD_Sketcher.zip > "$OUT/build_base.log" 2>&1
+          "$BLENDER" --background --command extension install-file --repo user_default --enable ./CAD_Sketcher.zip > "$OUT/install_base.log" 2>&1
+          "$BLENDER" --background --python ./scripts/ci_run_tests.py > "$OUT/tests_base.log" 2>&1
+
+      - name: Compare PR vs base
+        if: always()
+        run: |
+          cd "$OUT"
+          summary() { { grep -E '^Ran [0-9]+ tests' "$1"; grep -E '^(OK|FAILED)( |$)' "$1"; } 2>/dev/null | tr -d '\r' | tr '\n' ' ' || true; }
+          fails() { { grep -E '^(FAIL|ERROR): ' "$1" 2>/dev/null || true; } | tr -d '\r' | sort -u; }
+          fails tests_pr.log > fails_pr.txt; fails tests_base.log > fails_base.txt
+          comm -23 fails_pr.txt fails_base.txt > fails_pr_only.txt
+          comm -13 fails_pr.txt fails_base.txt > fails_base_only.txt
+          {
+            echo "### ${{ matrix.os }} / Blender $BL_VERSION"
+            echo '```'
+            echo "PR   ($PR_SHA): $(summary tests_pr.log)"
+            echo "base ($BASE_SHA): $(summary tests_base.log)"
+            echo "Failures on PR:"; cat fails_pr.txt
+            echo "Failures only on PR (regressions):"; cat fails_pr_only.txt
+            echo "Failures only on base:"; cat fails_base_only.txt
+            echo '```'
+          } | tee summary.md >> "$GITHUB_STEP_SUMMARY"
+          cat summary.md
+          grep -qE '^Ran [0-9]+ tests' tests_pr.log || { echo "::error::PR test run did not complete"; exit 1; }
+          if [ -s fails_pr_only.txt ]; then echo "::error::failures not present on base"; exit 1; fi
+
+      - name: Software OpenGL for the render (Windows)
+        if: always() && runner.os == 'Windows'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$TMPD"
+          url=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest \
+                | grep -oE '"browser_download_url": *"[^"]*release-msvc\.7z"' | head -1 | sed -E 's/.*"(https[^"]*)"/\1/')
+          echo "Mesa: $url"
+          curl -fL --retry 5 -sS -o mesa.7z "$url"
+          7z x -y -bd mesa.7z -omesa > /dev/null
+          for dll in opengl32.dll libgallium_wgl.dll libglapi.dll dxil.dll; do
+            [ -f "mesa/x64/$dll" ] && cp "mesa/x64/$dll" "$BLENDER_DIR/" && echo "copied $dll"
+          done
+          echo "GALLIUM_DRIVER=llvmpipe" >> "$GITHUB_ENV"
+
+      - name: Offscreen dimension render
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          wp() { if [ "$RUNNER_OS" = "Windows" ]; then cygpath -w "$1"; else echo "$1"; fi; }
+          export BLENDER_USER_RESOURCES="$(wp "$TMPD/user_pr")"
+          export LIBGL_ALWAYS_SOFTWARE=1
+          cat > "$TMPD/render_dimension_compare.py" <<'PY'
+          """Offscreen render of dimension strokes: before (1px LINES) vs scale 1/2/4.
+
+          Usage: blender [--background] --python render_dimension_compare.py -- OUT_DIR
+          Writes OUT_DIR/dimension_<label>.png and dimension_compare.png. Exits 0 on
+          success, 2 if the GPU module is unavailable (e.g. no GPU in background mode).
+          """
+
+          import importlib
+          import os
+          import sys
+          import traceback
+
+          import addon_utils
+          import bpy
+
+          W, H = 360, 240
+          PKG = None
+
+
+          def find_pkg():
+              for mod in addon_utils.modules():
+                  if mod.__name__.split(".")[-1] == "CAD_Sketcher":
+                      return mod.__name__
+              raise SystemExit("CAD_Sketcher extension not installed")
+
+
+          def geometry():
+              # (leader, witness) segments in NDC, LINES pairs: a horizontal dimension
+              # with arrowheads, two extension lines, and a diagonal/arc-ish leader.
+              y = 0.15
+              leader = [(-0.7, y), (0.7, y),
+                        (-0.7, y), (-0.6, y + 0.05), (-0.7, y), (-0.6, y - 0.05),
+                        (0.7, y), (0.6, y + 0.05), (0.7, y), (0.6, y - 0.05),
+                        (-0.6, -0.6), (0.2, -0.2)]
+              witness = [(-0.7, -0.35), (-0.7, y + 0.12), (0.7, -0.35), (0.7, y + 0.12)]
+              to3 = lambda pts: [(x, yy, 0.0) for x, yy in pts]
+              return to3(leader), to3(witness)
+
+
+          class _Region:
+              width = W
+              height = H
+
+
+          class _Ctx:
+              region = _Region()
+
+
+          def draw(label, scale):
+              import gpu
+              from gpu_extras.batch import batch_for_shader
+              from mathutils import Matrix
+
+              base = importlib.import_module(PKG + ".gizmos.base")
+              prefs = importlib.import_module(PKG + ".utilities.preferences").get_prefs()
+              leader, witness = geometry()
+              color = (0.95, 0.95, 0.95, 1.0)
+              off = gpu.types.GPUOffScreen(W, H)
+              with off.bind():
+                  fb = gpu.state.active_framebuffer_get()
+                  fb.clear(color=(0.16, 0.16, 0.16, 1.0))
+                  with gpu.matrix.push_pop():
+                      gpu.matrix.load_matrix(Matrix.Identity(4))
+                      gpu.matrix.load_projection_matrix(Matrix.Identity(4))
+                      if scale is None:
+                          sh = gpu.shader.from_builtin("UNIFORM_COLOR")
+                          gpu.state.line_width_set(1.0)
+                          sh.bind()
+                          sh.uniform_float("color", color)
+                          batch_for_shader(sh, "LINES", {"pos": witness + leader}).draw(sh)
+                      else:
+                          prefs.dimension_line_scale = scale
+                          ident = Matrix.Identity(4)
+                          base._draw_dimension_lines(
+                              _Ctx(), base._line_batch(ident, leader),
+                              base._line_batch(ident, witness), color)
+                  buf = fb.read_color(0, 0, W, H, 4, 0, "FLOAT")
+              off.free()
+              buf.dimensions = W * H * 4
+              return list(buf)
+
+
+          def save(pixels, w, h, path):
+              img = bpy.data.images.new(os.path.basename(path), w, h, alpha=True)
+              img.pixels.foreach_set(pixels)
+              img.filepath_raw = path
+              img.file_format = "PNG"
+              img.save()
+              bpy.data.images.remove(img)
+              print("saved", path, flush=True)
+
+
+          def main():
+              global PKG
+              out = sys.argv[sys.argv.index("--") + 1] if "--" in sys.argv else os.getcwd()
+              os.makedirs(out, exist_ok=True)
+              PKG = find_pkg()
+              addon_utils.enable(PKG, default_set=True)
+              print("Blender", bpy.app.version_string, "background", bpy.app.background,
+                    "platform", sys.platform, flush=True)
+              try:
+                  import gpu
+                  if bpy.app.background and hasattr(gpu, "init"):
+                      gpu.init()  # Blender 5.x: opt-in GPU context in background mode
+                  print("GPU backend:", gpu.platform.backend_type_get(),
+                        gpu.platform.renderer_get(), flush=True)
+              except Exception as exc:
+                  print("GPU unavailable:", exc, flush=True)
+                  return 2
+              variants = [("before", None), ("scale1", 1.0), ("scale2", 2.0), ("scale4", 4.0)]
+              rows = []
+              for label, scale in variants:
+                  px = draw(label, scale)
+                  save(px, W, H, os.path.join(out, f"dimension_{label}.png"))
+                  # Sanity: count lit pixels so the log shows stroke thickness growing.
+                  lit = sum(1 for i in range(0, len(px), 4) if px[i] > 0.5)
+                  print(f"RENDER {label}: lit_pixels={lit}", flush=True)
+                  rows.append(px)
+              # Side-by-side compare strip (bottom-up rows).
+              strip = []
+              for y in range(H):
+                  for px in rows:
+                      strip.extend(px[y * W * 4:(y + 1) * W * 4])
+              save(strip, W * len(rows), H, os.path.join(out, "dimension_compare.png"))
+              return 0
+
+
+          if __name__ == "__main__":
+              code = 1
+              try:
+                  code = main()
+              except BaseException:
+                  traceback.print_exc()
+              sys.stdout.flush()
+              os._exit(code)
+          PY
+          cd "$TMPD"
+          script=./render_dimension_compare.py
+          dest="$(wp "$OUT/render")"
+          run() {
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              mkdir -p "$TMPD/xdg"; chmod 700 "$TMPD/xdg"
+              XDG_RUNTIME_DIR="$TMPD/xdg" xvfb-run -a -s "-screen 0 1280x800x24" "$BLENDER" "$@"
+            else
+              "$BLENDER" "$@"
+            fi
+          }
+          # Blender 5.1+ can create a GPU context in background mode (gpu.init);
+          # older versions exit 2 here and get a real window instead.
+          set +e
+          run --background --python "$script" -- "$dest" 2>&1 | tee "$OUT/render.log"
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" = "2" ]; then
+            echo "Background GPU unavailable, retrying with a window" | tee -a "$OUT/render.log"
+            extra=""; [ "$RUNNER_OS" != "macOS" ] && extra="--gpu-backend opengl"
+            run --factory-startup $extra --python "$script" -- "$dest" 2>&1 | tee -a "$OUT/render.log"
+            rc=${PIPESTATUS[0]}
+          fi
+          ls -la "$OUT/render" 2>/dev/null
+          exit $rc
+
+      - name: Upload logs and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xplat-${{ matrix.os }}-blender-${{ matrix.blender }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
